@@ -4,7 +4,7 @@
 # apt-get install python3-ldap3
 
 try:
-    # system libraries we should have no error here
+	# system libraries we should have no error here
 	import string
 	#from StringIO import StringIO
 	import time
@@ -41,6 +41,12 @@ try:
 	#from ldap3 import Server, Connection, ALL, SUBTREE, BASE, LEVEL, MODIFY_REPLACE
 except ImportError:
 	print("Cannot find library ssl, please install it and try again")
+	raise SystemExit
+
+try:
+	from urllib.parse import urlparse
+except ImportError:
+	print("Cannot find library urllib3, please install it and try again")
 	raise SystemExit
 
 try:
@@ -176,10 +182,41 @@ class RetrieveMails(threading.Thread):
 	
 	# Updates the LDAP-Directory to store the date and time of the last mail retrieval
 	def update_ldap(self):
-        # use ssl/tls
-		tls = ldap3.Tls(validate=ssl.CERT_REQUIRED)
-		server = ldap3.Server(self.ldap_details.server, get_info=ldap3.ALL, use_ssl = True, tls = tls)
-		with ldap3.Connection(server, user=self.ldap_details.bind_dn, password=self.ldap_details.bind_password, auto_bind=True) as conn:
+		# check if ssl/tls are used
+		use_ssl = self.ldap_details.ssl_mode == 'ssl'
+		start_tls = self.ldap_details.ssl_mode == 'starttls'
+
+		# create tls config if necessary
+		tls = None
+		if use_ssl or start_tls:
+			tls = ldap3.Tls(validate=ssl.CERT_REQUIRED)
+		# if multiple servers are given, add each of them zo the server pool
+		server_pool = ldap3.ServerPool(None, ldap3.ROUND_ROBIN, active=True, exhaust=30)
+
+		# add each server to the pool
+		for server_url in self.ldap_details.server.split(','):
+			parsed_url = urlparse(server_url.strip())
+			if parsed_url.scheme == "ldaps":
+				use_ssl = True
+				port = 636
+			elif parsed_url.scheme == "ldap":
+				use_ssl = False
+				port = 389
+			elif parsed_url.scheme == "ldapi":
+				use_ssl = False
+				port = None
+			else:
+				raise RuntimeError(f"Unknown scheme '{parsed_url.scheme}' in URL '{server_url.strip()}'")
+
+			if parsed_url.port:
+				port = parsed_url.port
+			
+			host = parsed_url.hostname
+			server = ldap3.Server(host, port=port, use_ssl=use_ssl, tls=tls, get_info=ldap3.ALL)
+			server_pool.add(server)
+
+		# establish connection
+		with ldap3.Connection(server_pool, user=self.ldap_details.bind_dn, password=self.ldap_details.bind_password, auto_bind=True) as conn:
 			return conn.modify(self.ldap_details.write_dn, {self.ldap_details.attribute: [(ldap3.MODIFY_REPLACE, [datetime.utcnow().strftime("%Y%m%d%H%M%SZ")])]})
 			#print(conn.result)
 
@@ -189,9 +226,9 @@ class RetrieveAccount:
 			account_name, account_type, login, password, server, mail_fetch_interval, last_mail_retrieval, imap_idle, imap_idle_timeout
 
 class LDAPOptions:
-	def __init__(self, server=None, bind_dn=None, bind_password=None, write_dn=None, attribute=None):
-		self.server, self.bind_dn, self.bind_password, self.write_dn, self.attribute = \
-			server, bind_dn, bind_password, write_dn, attribute
+	def __init__(self, server=None, ssl_mode=None, bind_dn=None, bind_password=None, write_dn=None, attribute=None):
+		self.server, self.ssl_mode, self.bind_dn, self.bind_password, self.write_dn, self.attribute = \
+			server, ssl_mode, bind_dn, bind_password, write_dn, attribute
 
 class GetmailConfigFile(configparser.ConfigParser):
 	output_filename = None
@@ -231,15 +268,44 @@ def main_call():
 	#print(config_object.get('LDAP','LDAPServer'));
 	# first open a connection to the LDAP server
 	ldap_options = LDAPOptions( \
-		config_object.get('LDAP','LDAPServer'), \
-		config_object.get('LDAP','BindDN'), \
-		config_object.get('LDAP','BindPassword'))
+		config_object['LDAP']['LDAPServer'], \
+		config_object['LDAP']['SSLMode'], \
+		config_object['LDAP']['BindDN'], \
+		config_object['LDAP']['BindPassword'])
 
-	# use ssl/tls
-	tls = ldap3.Tls(validate=ssl.CERT_REQUIRED)
-	
-	server = ldap3.Server(ldap_options.server, get_info=ldap3.ALL, use_ssl = True, tls = tls)
-	with ldap3.Connection(server, user=ldap_options.bind_dn, password=ldap_options.bind_password, auto_bind=True, return_empty_attributes=True) as conn:
+	# check if ssl/tls are used
+	use_ssl = ldap_options.ssl_mode == 'ssl'
+	start_tls = ldap_options.ssl_mode == 'starttls'
+
+	# create tls config if necessary
+	tls = None
+	if use_ssl or start_tls:
+		tls = ldap3.Tls(validate=ssl.CERT_REQUIRED)
+	# if multiple servers are given, add each of them zo the server pool
+	server_pool = ldap3.ServerPool(None, ldap3.ROUND_ROBIN, active=True, exhaust=30)
+
+	for server_url in ldap_options.server.split(','):
+		parsed_url = urlparse(server_url.strip())
+		if parsed_url.scheme == "ldaps":
+			use_ssl = True
+			port = 636
+		elif parsed_url.scheme == "ldap":
+			use_ssl = False
+			port = 389
+		elif parsed_url.scheme == "ldapi":
+			use_ssl = False
+			port = None
+		else:
+			raise RuntimeError(f"Unknown scheme '{parsed_url.scheme}' in URL '{server_url.strip()}'")
+
+		if parsed_url.port:
+			port = parsed_url.port
+		
+		host = parsed_url.hostname
+		server = ldap3.Server(host, port=port, use_ssl=use_ssl, tls=tls, get_info=ldap3.ALL)
+		server_pool.add(server)
+
+	with ldap3.Connection(server_pool, user=ldap_options.bind_dn, password=ldap_options.bind_password, auto_bind=True, return_empty_attributes=True) as conn:
 		
 		## The next lines will also need to be changed to support your search requirements and directory
 		## retrieve all attributes - again adjust to your needs - see documentation for more options
@@ -346,7 +412,7 @@ def main_call():
 					config_object.get('Main','GetmailDir'), \
 					pid_filename, \
 					# new instance of the class needed to make sure variables are correct in the thread!
-					LDAPOptions(ldap_options.server, ldap_options.bind_dn, ldap_options.bind_password, ldap_options.write_dn, ldap_options.attribute), \
+					LDAPOptions(ldap_options.server, ldap_options.ssl_mode, ldap_options.bind_dn, ldap_options.bind_password, ldap_options.write_dn, ldap_options.attribute), \
 					account.imap_idle, \
 					account.imap_idle_timeout \
 				)
@@ -401,6 +467,4 @@ if __name__ == "__main__":
 	try:
 		main_call();
 	except:
-		log_object.exception("An error occured!")		
-
-
+		log_object.exception("An error occured!")
